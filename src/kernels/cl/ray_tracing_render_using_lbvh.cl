@@ -28,12 +28,68 @@ static inline bool bvh_closest_hit(
     __private float*          outU, // сюда нужно записать u рассчитанный в intersect_ray_triangle(..., t, u, v)
     __private float*          outV) // сюда нужно записать v рассчитанный в intersect_ray_triangle(..., t, u, v)
 {
-    const int rootIndex = 0;
+    const int root = 0;
     const int leafStart = (int)nfaces - 1;
+    int stack[64];
+    int sp = 0;
+    stack[sp++] = root;
+    bool hitAnything = false;
 
-    // TODO implement BVH travering (with stack, don't use recursion)
+    while (sp > 0) {
+        int idx = stack[--sp];
+        BVHNodeGPU node = nodes[idx];
+        float tHitNear = 0.0f, tHitFar = 0.0f;
+        if (!intersect_ray_aabb(orig, dir, node.aabb, tMin, *outT, &tHitNear, &tHitFar)) {
+            continue;
+        }
+        if (idx >= leafStart) {
+            int leafId = idx - leafStart;
+            uint triId = leafTriIndices[leafId];
+            uint3 f = loadFace(faces, triId);
+            float3 A = loadVertex(vertices, f.x);
+            float3 B = loadVertex(vertices, f.y);
+            float3 C = loadVertex(vertices, f.z);
+            float t, u, v;
+            if (intersect_ray_triangle(orig, dir, A, B, C, tMin, *outT, false, &t, &u, &v)) {
+                if (t >= tMin && t < *outT) {
+                    *outT = t;
+                    *outFaceId = (int)triId;
+                    *outU = u;
+                    *outV = v;
+                    hitAnything = true;
+                }
+            }
+        } else {
+            uint L = node.leftChildIndex;
+            uint R = node.rightChildIndex;
+            float tL = FLT_MAX, tR = FLT_MAX;
+            bool hL = false, hR = false;
+            if (L != 0xFFFFFFFFu) {
+                hL = intersect_ray_aabb(orig, dir, nodes[L].aabb, tMin, *outT, &tL, &tHitFar);
+            }
+            if (R != 0xFFFFFFFFu) {
+                hR = intersect_ray_aabb(orig, dir, nodes[R].aabb, tMin, *outT, &tR, &tHitFar);
+            }
+            if (hL && hR) {
+                if (tL < tR) {
+                    stack[sp++] = R;
+                    stack[sp++] = L;
+                } else {
+                    stack[sp++] = L;
+                    stack[sp++] = R;
+                }
+            } else if (hL) {
+                stack[sp++] = L;
+            } else if (hR) {
+                stack[sp++] = R;
+            }
+            if (sp >= (int)(sizeof(stack)/sizeof(stack[0]) - 2)) {
+                sp = (int)(sizeof(stack)/sizeof(stack[0]) - 2);
+            }
+        }
+    }
 
-    return false;
+    return hitAnything;
 }
 
 // Cast a single ray and report if ANY occluder is hit (for ambient occlusion)
@@ -47,10 +103,49 @@ static inline bool any_hit_from(
     uint                      nfaces,
     int                       ignore_face)
 {
-    const int rootIndex = 0;
+    const int root = 0;
     const int leafStart = (int)nfaces - 1;
+    int stack[64];
+    int sp = 0;
+    stack[sp++] = root;
 
-    // TODO implement BVH travering (with stack, don't use recursion)
+    while (sp > 0) {
+        int idx = stack[--sp];
+        BVHNodeGPU node = nodes[idx];
+        float tHitNear = 0.0f, tHitFar = 0.0f;
+        if (!intersect_ray_aabb(orig, dir, node.aabb, 1e-6f, FLT_MAX, &tHitNear, &tHitFar)) {
+            continue;
+        }
+        if (idx >= leafStart) {
+            int leafId = idx - leafStart;
+            uint triId = leafTriIndices[leafId];
+            if ((int)triId == ignore_face) {
+                continue;
+            }
+            uint3 f = loadFace(faces, triId);
+            float3 A = loadVertex(vertices, f.x);
+            float3 B = loadVertex(vertices, f.y);
+            float3 C = loadVertex(vertices, f.z);
+            float t, u, v;
+            if (intersect_ray_triangle(orig, dir, A, B, C, 1e-6f, FLT_MAX, false, &t, &u, &v)) {
+                if (t >= 1e-6f) {
+                    return true;
+                }
+            }
+        } else {
+            uint L = node.leftChildIndex;
+            uint R = node.rightChildIndex;
+            if (L != 0xFFFFFFFFu) {
+                stack[sp++] = L;
+            }
+            if (R != 0xFFFFFFFFu) {
+                stack[sp++] = R;
+            }
+            if (sp >= (int)(sizeof(stack)/sizeof(stack[0]) - 2)) {
+                sp = (int)(sizeof(stack)/sizeof(stack[0]) - 2);
+            }
+        }
+    }
 
     return false;
 }
