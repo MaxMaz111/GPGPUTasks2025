@@ -15,6 +15,7 @@ namespace ocl {
 const ProgramBinaries& getAplusB();
 
 const ProgramBinaries& getFillBufferWithZeros();
+const ProgramBinaries& getRadixSort00CopyArray();
 const ProgramBinaries& getRadixSort01LocalCounting();
 const ProgramBinaries& getRadixSort02GlobalPrefixesScanSumReduction();
 const ProgramBinaries& getRadixSort03GlobalPrefixesScanAccumulation();

@@ -1,8 +1,8 @@
 #include <libbase/stats.h>
 #include <libutils/misc.h>
 
-#include <libbase/timer.h>
 #include <libbase/fast_random.h>
+#include <libbase/timer.h>
 #include <libgpu/vulkan/engine.h>
 #include <libgpu/vulkan/tests/test_utils.h>
 
@@ -37,6 +37,7 @@ void run(int argc, char** argv)
     //          кроме того используемая библиотека поддерживает rassert-проверки (своеобразные инварианты с уникальным числом) на видеокарте для Vulkan
 
     ocl::KernelSource ocl_fillBufferWithZeros(ocl::getFillBufferWithZeros());
+    ocl::KernelSource ocl_radixSort00CopyArray(ocl::getRadixSort00CopyArray());
     ocl::KernelSource ocl_radixSort01LocalCounting(ocl::getRadixSort01LocalCounting());
     ocl::KernelSource ocl_radixSort02GlobalPrefixesScanSumReduction(ocl::getRadixSort02GlobalPrefixesScanSumReduction());
     ocl::KernelSource ocl_radixSort03GlobalPrefixesScanAccumulation(ocl::getRadixSort03GlobalPrefixesScanAccumulation());
@@ -50,7 +51,7 @@ void run(int argc, char** argv)
 
     FastRandom r;
 
-    int n = 100*1000*1000; // TODO при отладке используйте минимальное n (например n=5 или n=10) при котором воспроизводится бага
+    int n = 100 * 1000 * 1000; // TODO при отладке используйте минимальное n (например n=5 или n=10) при котором воспроизводится бага
     int max_value = std::numeric_limits<int>::max(); // TODO при отладке используйте минимальное max_value (например max_value=8) при котором воспроизводится бага
     std::vector<unsigned int> as(n, 0);
     std::vector<unsigned int> sorted(n, 0);
@@ -85,9 +86,15 @@ void run(int argc, char** argv)
         std::cout << "CPU std::sort effective RAM bandwidth: " << memory_size_gb / t.elapsed() << " GB/s (" << n / 1000 / 1000 / t.elapsed() << " uint millions/s)" << std::endl;
     }
 
-    // Аллоцируем буферы в VRAM
+    auto ceil = [&](const uint a, const uint b) {
+        return (a + b - 1) / b;
+    };
+
+    const unsigned int b = ceil(n, GROUP_SIZE) << BIT_BATCH;
+
     gpu::gpu_mem_32u input_gpu(n);
-    gpu::gpu_mem_32u buffer1_gpu(n), buffer2_gpu(n), buffer3_gpu(n), buffer4_gpu(n); // TODO это просто шаблонка, можете переименовать эти буферы, сделать другого размера/типа, удалить часть, добавить новые
+    gpu::gpu_mem_32u buffer1_gpu(n), buffer2_gpu(b), buffer3_gpu(b), buffer4_gpu(b);
+    gpu::gpu_mem_32u buffer5_gpu(b);
     gpu::gpu_mem_32u buffer_output_gpu(n);
 
     // Прогружаем входные данные по PCI-E шине: CPU RAM -> GPU VRAM
@@ -106,34 +113,33 @@ void run(int argc, char** argv)
     for (int iter = 0; iter < 10; ++iter) { // TODO при отладке запускайте одну итерацию
         timer t;
 
-        // Запускаем кернел, с указанием размера рабочего пространства и передачей всех аргументов
-        // Если хотите - можете удалить ветвление здесь и оставить только тот код который соответствует вашему выбору API
-        if (context.type() == gpu::Context::TypeOpenCL) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // ocl_fillBufferWithZeros.exec();
-            // ocl_radixSort01LocalCounting.exec();
-            // ocl_radixSort02GlobalPrefixesScanSumReduction.exec();
-            // ocl_radixSort03GlobalPrefixesScanAccumulation.exec();
-            // ocl_radixSort04Scatter.exec();
-        } else if (context.type() == gpu::Context::TypeCUDA) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // cuda::fill_buffer_with_zeros();
-            // cuda::radix_sort_01_local_counting();
-            // cuda::radix_sort_02_global_prefixes_scan_sum_reduction();
-            // cuda::radix_sort_03_global_prefixes_scan_accumulation();
-            // cuda::radix_sort_04_scatter();
-        } else if (context.type() == gpu::Context::TypeVulkan) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // vk_fillBufferWithZeros.exec();
-            // vk_radixSort01LocalCounting.exec();
-            // vk_radixSort02GlobalPrefixesScanSumReduction.exec();
-            // vk_radixSort03GlobalPrefixesScanAccumulation.exec();
-            // vk_radixSort04Scatter.exec();
-        } else {
-            rassert(false, 4531412341, context.type());
+        ocl_radixSort00CopyArray.exec(gpu::WorkSize(GROUP_SIZE, n), input_gpu, buffer1_gpu, n);
+
+        gpu::WorkSize workSize(GROUP_SIZE, n);
+
+        for (uint32_t bit = 0; bit < 32; bit += BIT_BATCH) {
+            ocl_fillBufferWithZeros.exec(workSize, buffer5_gpu, b);
+
+            ocl_radixSort01LocalCounting.exec(workSize, buffer1_gpu, buffer2_gpu, n, bit);
+
+            uint scan_pass = 0;
+            ocl_radixSort03GlobalPrefixesScanAccumulation.exec(workSize, buffer2_gpu, buffer5_gpu, b, scan_pass++);
+
+            ocl_radixSort02GlobalPrefixesScanSumReduction.exec(workSize, buffer2_gpu, buffer3_gpu, b);
+
+            uint prefix_pairs = ceil(b, 2);
+            gpu::gpu_mem_32u* scan_buffers[2] = { &buffer3_gpu, &buffer4_gpu };
+            int cur_index = 0;
+
+            while (prefix_pairs > 1) {
+                ocl_radixSort03GlobalPrefixesScanAccumulation.exec(workSize, *scan_buffers[cur_index], buffer5_gpu, b, scan_pass++);
+                ocl_radixSort02GlobalPrefixesScanSumReduction.exec(workSize, *scan_buffers[cur_index], *scan_buffers[1 - cur_index], prefix_pairs);
+                prefix_pairs = ceil(prefix_pairs, 2);
+                cur_index = 1 - cur_index;
+            }
+            ocl_radixSort04Scatter.exec(workSize, buffer1_gpu, buffer5_gpu, buffer_output_gpu, n, bit);
+
+            std::swap(buffer1_gpu, buffer_output_gpu);
         }
 
         times.push_back(t.elapsed());
@@ -145,7 +151,7 @@ void run(int argc, char** argv)
     std::cout << "GPU radix-sort median effective VRAM bandwidth: " << memory_size_gb / stats::median(times) << " GB/s (" << n / 1000 / 1000 / stats::median(times) << " uint millions/s)" << std::endl;
 
     // Считываем результат по PCI-E шине: GPU VRAM -> CPU RAM
-    std::vector<unsigned int> gpu_sorted = buffer_output_gpu.readVector();
+    std::vector<unsigned int> gpu_sorted = buffer1_gpu.readVector();
 
     // Сверяем результат
     for (size_t i = 0; i < n; ++i) {
@@ -168,7 +174,8 @@ int main(int argc, char** argv)
         if (e.what() == DEVICE_NOT_SUPPORT_API) {
             // Возвращаем exit code = 0 чтобы на CI не было красного крестика о неуспешном запуске из-за выбора CUDA API (его нет на процессоре - т.е. в случае CI на GitHub Actions)
             return 0;
-        } if (e.what() == CODE_IS_NOT_IMPLEMENTED) {
+        }
+        if (e.what() == CODE_IS_NOT_IMPLEMENTED) {
             // Возвращаем exit code = 0 чтобы на CI не было красного крестика о неуспешном запуске из-за того что задание еще не выполнено
             return 0;
         } else {

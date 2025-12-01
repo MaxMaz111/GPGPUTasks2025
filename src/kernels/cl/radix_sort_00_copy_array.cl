@@ -7,22 +7,10 @@
 
 __attribute__((reqd_work_group_size(GROUP_SIZE, 1, 1)))
 __kernel void
-radix_sort_03_global_prefixes_scan_accumulation(
-    __global const uint* sum_in,
-    __global uint* sum_out,
-    const uint n,
-    const uint shift_exp)
+radix_sort_00_copy_array(__global const uint* from, __global uint* to, uint n)
 {
     const uint index = get_global_id(0);
-
-    if (index >= n) {
-        return;
+    if (index < n) {
+        to[index] = from[index];
     }
-
-    const uint seg = (index + 1) >> shift_exp;
-
-    if (!(seg & 1)) {
-        return;
-    }
-    sum_out[index] += sum_in[seg - 1];
 }
